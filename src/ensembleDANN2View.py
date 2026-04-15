@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.optim as optim
 import numpy as np
 from torch.autograd import Function
+import torchvision.transforms as T
 from torch.utils.data import DataLoader
 from dataset import generate_data
 from synthetic_dataset import SyntheticDataset
@@ -156,6 +157,20 @@ class SquaredCorrelationLoss(nn.Module):
 # ==========================================
 # 3. TRAINING AND EVALUATION LOOP
 # ==========================================
+# 1. Use Gaussian Noise instead of Spatial Flips
+def add_gaussian_noise(tensor, std=0.05):
+    return tensor + torch.randn(tensor.size()).to(tensor.device) * std
+
+
+
+# 1. Update the Training Augmentations (Per Page 10 of the paper)
+# Since your data is 32x32 grayscale, we adapt the paper's strategy [cite: 516-519]
+train_transform = T.Compose([
+    T.RandomHorizontalFlip(p=0.5),
+    T.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.9, 1.1)),
+    # We omit color jitter/grayscale as your data is already synthetic grayscale
+])
+
 def train_and_benchmark():
     results_ACCd = []
     results_BWTd = []
@@ -163,14 +178,13 @@ def train_and_benchmark():
 
     for run_seed in [42, 1234, 9999]:
         set_seed(run_seed)
-    
+
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        
-        # Because the seed is locked, these weights will initialize identically every time
         model = DiversityEnsembleDANN().to(device)
 
         criterion_class = nn.CrossEntropyLoss()
         criterion_conf = SquaredCorrelationLoss() 
+
         # Lower LR to 0.0001 and add weight decay (L2 regularization)
         optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=0.0001)
         
@@ -178,103 +192,85 @@ def train_and_benchmark():
         epochs = 100
         scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
         
-
         num_stages = 5
+
         A_i = 0.75 
         R = np.zeros((num_stages, num_stages))
-        
-        # The paper's scaling factor for distribution shifts
         step_size = 0.125 
 
-        # --- 1. PRE-GENERATE THE PAPER'S TEST SETS ---
+        # --- 1. PRE-GENERATE TEST SETS (Single View as per Paper ) ---
         test_loaders = []
         for stage in range(num_stages):
             scale_shift = stage * step_size
-            
-
-            # 1. Generate raw data
-            # 1. Validation Data
             cf_val, _, x_val, y_val = generate_data(N=500, seed=1235, scale=scale_shift)
-            test_dataset = SyntheticDataset(x_val, y_val, cf_val) # NORMAL ORDER
+            test_dataset = SyntheticDataset(x_val, y_val, cf_val)
             test_loaders.append(DataLoader(test_dataset, batch_size=128))
 
-
-
-
-
-
-        # --- 2. THE TRAINING LOOP ---
+        # --- 2. THE TWO-VIEW TRAINING LOOP ---
         for stage in range(num_stages):
             print(f"\n--- Training on Stage {stage + 1} ---")
             scale_shift = stage * step_size
-            
-
-
-
-            # 2. Training Data
             cf_train, _, x_train, y_train = generate_data(N=2048, seed=1234, scale=scale_shift)
-            train_dataset = SyntheticDataset(x_train, y_train, cf_train) # NORMAL ORDER
+            train_dataset = SyntheticDataset(x_train, y_train, cf_train)
             train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
 
-
-
-
-            
-
-
-            # --- Define Hyperparameters Here ---
-            lambda_dann = 5.0    # High penalty to prevent cheating
-            lambda_div = 0.5      # Max diversity penalty, used to be 0.1 then 0.5, 0.6 did not work
-            alpha_margin = 1.0    # Margin for the diversity loss standard deviation
+            # Hyperparameters
+            lambda_dann = 5.0    
+            lambda_div = 0.5     
+            alpha_margin = 1.0   
 
             model.train()
 
-
             for epoch in range(epochs): 
                 for i, batch in enumerate(train_loader):
-                    # Pull from dictionary
-                    X_batch = batch['image'].to(device).float()
+                    X_orig = batch['image'].to(device).float().permute(0, 3, 1, 2)
                     y_batch = batch['label'].to(device).long()
                     conf_batch = batch['cfs'].to(device).float()
                     
-                    # CHANGE SHAPE: [128, 32, 32, 1] -> [128, 1, 32, 32]
-                    X_batch = X_batch.permute(0, 3, 1, 2)
+                    # --- NEW TWO-VIEW GENERATION (Safe for Blobs) ---
+                    # View 1 and View 2 are the same blobs, just with different noise
+                    X1 = add_gaussian_noise(X_orig, std=0.05)
+                    X2 = add_gaussian_noise(X_orig, std=0.10) # Slightly noisier view
                     
-                    # Dynamic alpha for DANN warm-up
+                    # --- ADJUST HYPERPARAMETERS ---
+                    # Because we have TWO views, the adversary (DANN) is twice as present.
+                    # Lower lambda_dann to compensate.
+                    lambda_dann = 2.0  # Lowered from 5.0
+                    lambda_div = 0.5
+                    
+                    # Dynamic alpha for DANN
                     p = float(i + epoch * len(train_loader)) / (epochs * len(train_loader))
                     alpha = 2. / (1. + np.exp(-10 * p)) - 1
                     
-                    
                     optimizer.zero_grad()
                     
-                    # Pass to your Ensemble DANN
-                    class_preds, conf_preds, stacked_outputs = model(X_batch, alpha=alpha)
+                    # Forward pass for both views [cite: 83, 84]
+                    preds1, confs1, subnets1 = model(X1, alpha=alpha)
+                    preds2, confs2, subnets2 = model(X2, alpha=alpha)
                     
-                    # 1. Classification Loss
-                    loss_class = criterion_class(class_preds, y_batch)
+                    # 1. Classification Loss (Average of both views) [cite: 91, 92]
+                    loss_class = (criterion_class(preds1, y_batch) + criterion_class(preds2, y_batch)) / 2
                     
-                    # 2. Confounder Loss
-                    loss_conf = criterion_conf(conf_preds, conf_batch)
+                    # 2. Confounder Loss (Average of both views)
+                    loss_conf = (criterion_conf(confs1, conf_batch) + criterion_conf(confs2, conf_batch)) / 2
                     
-                    # 3. Diversity Loss Calculation
-                    std_dev = torch.sqrt(stacked_outputs.var(dim=1) + 1e-8).mean()
-                    loss_div = torch.clamp(alpha_margin - std_dev, min=0.0)
+                    # 3. Diversity Loss (Summed across both views as per Eq 2 )
+                    std1 = torch.sqrt(subnets1.var(dim=1) + 1e-8).mean()
+                    std2 = torch.sqrt(subnets2.var(dim=1) + 1e-8).mean()
                     
-                    # Smoothly scale the diversity penalty from 0 up to lambda_div
+                    loss_div = torch.clamp(alpha_margin - std1, min=0.0) + \
+                            torch.clamp(alpha_margin - std2, min=0.0)
+                    
                     current_lambda_div = lambda_div * alpha
                     
-                    # Total Loss formulation
+                    # Total Combined Loss [cite: 119]
                     loss = loss_class + (lambda_dann * loss_conf) + (current_lambda_div * loss_div) 
                     
                     loss.backward()
                     optimizer.step()
                 scheduler.step()
-
-
-
-
-
-    # --- 3. EVALUATION LOOP (Single View Only ) ---
+                    
+            # --- 3. EVALUATION LOOP (Single View Only ) ---
             model.eval()
             with torch.no_grad():
                 for eval_stage in range(num_stages):
@@ -294,7 +290,7 @@ def train_and_benchmark():
         ACCd = np.mean([abs(R[num_stages-1][i] - A_i) for i in range(num_stages)])
         BWTd = np.mean([abs(R[num_stages-1][i] - A_i) - abs(R[i][i] - A_i) for i in range(num_stages - 1)])
         FWTd = np.mean([abs(R[i-1][i] - A_i) for i in range(1, num_stages)])
-            
+        
         results_ACCd.append(ACCd)
         results_BWTd.append(BWTd)
         results_FWTd.append(FWTd)
@@ -309,3 +305,56 @@ def train_and_benchmark():
 
 if __name__ == "__main__":
     train_and_benchmark()
+
+
+
+
+
+
+# import matplotlib.pyplot as plt
+# import numpy as np
+
+# # 1. Data from your 3-seed runs
+# labels = ['ACCd\n(Accuracy Error)', 'BWTd\n(Catastrophic Forgetting)', 'FWTd\n(Forward Transfer)']
+
+# # Means
+# baseline_means = [0.1296, -0.0498, 0.1726]
+# ensemble_means = [0.1564, -0.0493, 0.1962]
+# twoview_means  = [0.1887,  0.0617, 0.1564]
+
+# # Standard Deviations
+# baseline_std = [0.0022, 0.0036, 0.0009]
+# ensemble_std = [0.0662, 0.0468, 0.0545]
+# twoview_std  = [0.0620, 0.0520, 0.0171]
+
+# x = np.arange(len(labels))  # the label locations
+# width = 0.25  # the width of the bars
+
+# # 2. Setup the Plot
+# fig, ax = plt.subplots(figsize=(10, 6))
+
+# # 3. Create the Bars with Error Bars (yerr)
+# rects1 = ax.bar(x - width, baseline_means, width, yerr=baseline_std, 
+#                 label='Baseline DANN', capsize=5, color='#4c72b0', alpha=0.9)
+# rects2 = ax.bar(x, ensemble_means, width, yerr=ensemble_std, 
+#                 label='Ensemble (1 View)', capsize=5, color='#dd8452', alpha=0.9)
+# rects3 = ax.bar(x + width, twoview_means, width, yerr=twoview_std, 
+#                 label='Ensemble (2 Views)', capsize=5, color='#55a868', alpha=0.9)
+
+# # 4. Formatting
+# ax.set_ylabel('Metric Value (Closer to 0 is Better)', fontsize=12, fontweight='bold')
+# ax.set_title('Continual Learning Metrics Across 3 Random Seeds\n(Lower Absolute Values are Better)', 
+#              fontsize=14, fontweight='bold', pad=15)
+# ax.set_xticks(x)
+# ax.set_xticklabels(labels, fontsize=11)
+# ax.legend(fontsize=11)
+
+# # Add a horizontal line at 0 for reference
+# ax.axhline(0, color='black', linewidth=1, linestyle='--')
+
+# plt.grid(axis='y', linestyle='--', alpha=0.7)
+# plt.tight_layout()
+
+# # Save the figure
+# plt.savefig('benchmark_bar_chart.png', dpi=300)
+# print("Saved 'benchmark_bar_chart.png' successfully!")

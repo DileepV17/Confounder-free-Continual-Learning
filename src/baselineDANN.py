@@ -87,112 +87,120 @@ class DANN_Continual(nn.Module):
 # 3. TRAINING AND EVALUATION LOOP
 # ==========================================
 def train_and_benchmark():
-    # 1. Lock the seed before anything else happens!
-    set_seed(1234) 
+    results_ACCd = []
+    results_BWTd = []
+    results_FWTd = []
+
+    for run_seed in [42, 1234, 9999]:
+        set_seed(run_seed)
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = DANN_Continual().to(device)
-    
-    criterion_class = nn.CrossEntropyLoss()
-    criterion_conf = SquaredCorrelationLoss() 
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = DANN_Continual().to(device)
+        
+        criterion_class = nn.CrossEntropyLoss()
+        criterion_conf = SquaredCorrelationLoss() 
 
-    num_stages = 5
-    A_i = 0.75 
-    R = np.zeros((num_stages, num_stages))
-    epochs = 30
-    
-    # The paper's scaling factor for distribution shifts
-    step_size = 0.125 
 
-    # --- 1. PRE-GENERATE THE PAPER'S TEST SETS ---
-    test_loaders = []
-    for stage in range(num_stages):
-        scale_shift = stage * step_size
+# Lower LR to 0.0001 and add weight decay (L2 regularization)
+        optimizer = optim.Adam(model.parameters(), lr=0.0001, weight_decay=0.0001)
         
-        # FIXED UNPACKING AND SEED (1235 for validation)
-        cf_val, _, x_val, y_val = generate_data(N=500, seed=1235, scale=scale_shift)
-        
-        # Wrap it in their exact dataset class (NORMAL ORDER)
-        test_dataset = SyntheticDataset(x_val, y_val, cf_val)
-        test_loaders.append(DataLoader(test_dataset, batch_size=128))
+        # Add the Cosine Annealing Scheduler
+        epochs = 100
+        scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
-    # --- 2. THE TRAINING LOOP ---
-    for stage in range(num_stages):
-        print(f"\n--- Training on Stage {stage + 1} ---")
-        scale_shift = stage * step_size
+        num_stages = 5
+        A_i = 0.75 
+        R = np.zeros((num_stages, num_stages))
         
-        # FIXED UNPACKING AND SEED (1234 for training)
-        cf_train, _, x_train, y_train = generate_data(N=2048, seed=1234, scale=scale_shift)
-        
-        train_dataset = SyntheticDataset(x_train, y_train, cf_train)
-        train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
-        
-        # Set baseline adversarial penalty 
-        # (Using 5.0 to be comparable with the ensemble parameter)
-        lambda_dann = 5.0 
+        # The paper's scaling factor for distribution shifts
+        step_size = 0.125 
 
-        model.train()
-        for epoch in range(epochs): 
-            for i, batch in enumerate(train_loader):
-                # Pull from dictionary with proper types
-                X_batch = batch['image'].to(device).float()
-                y_batch = batch['label'].to(device).long()
-                conf_batch = batch['cfs'].to(device).float()
-                
-                # CHANGE SHAPE: [128, 32, 32, 1] -> [128, 1, 32, 32]
-                X_batch = X_batch.permute(0, 3, 1, 2)
-                
-                # Dynamic alpha for DANN warm-up
-                p = float(i + epoch * len(train_loader)) / (epochs * len(train_loader))
-                alpha = 2. / (1. + np.exp(-10 * p)) - 1
-                
-                optimizer.zero_grad()
-                
-                class_preds, conf_preds = model(X_batch, alpha=alpha)
-                loss_class = criterion_class(class_preds, y_batch)
-                loss_conf = criterion_conf(conf_preds, conf_batch)
-                
-                loss = loss_class + (lambda_dann * loss_conf) 
-                
-                loss.backward()
-                optimizer.step()
-                
-        # --- 3. THE EVALUATION LOOP ---
-        model.eval()
-        with torch.no_grad():
-            for eval_stage in range(num_stages):
-                correct, total = 0, 0
-                for batch in test_loaders[eval_stage]:
+        # --- 1. PRE-GENERATE THE PAPER'S TEST SETS ---
+        test_loaders = []
+        for stage in range(num_stages):
+            scale_shift = stage * step_size
+            
+            # FIXED UNPACKING AND SEED (1235 for validation)
+            cf_val, _, x_val, y_val = generate_data(N=500, seed=1235, scale=scale_shift)
+            
+            # Wrap it in their exact dataset class (NORMAL ORDER)
+            test_dataset = SyntheticDataset(x_val, y_val, cf_val)
+            test_loaders.append(DataLoader(test_dataset, batch_size=128))
+
+        # --- 2. THE TRAINING LOOP ---
+        for stage in range(num_stages):
+            print(f"\n--- Training on Stage {stage + 1} ---")
+            scale_shift = stage * step_size
+            
+            # FIXED UNPACKING AND SEED (1234 for training)
+            cf_train, _, x_train, y_train = generate_data(N=2048, seed=1234, scale=scale_shift)
+            
+            train_dataset = SyntheticDataset(x_train, y_train, cf_train)
+            train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
+            
+            # Set baseline adversarial penalty 
+            # (Using 5.0 to be comparable with the ensemble parameter)
+            lambda_dann = 5.0 
+
+            model.train()
+            for epoch in range(epochs): 
+                for i, batch in enumerate(train_loader):
                     # Pull from dictionary with proper types
                     X_batch = batch['image'].to(device).float()
                     y_batch = batch['label'].to(device).long()
+                    conf_batch = batch['cfs'].to(device).float()
                     
                     # CHANGE SHAPE: [128, 32, 32, 1] -> [128, 1, 32, 32]
                     X_batch = X_batch.permute(0, 3, 1, 2)
                     
-                    preds, _ = model(X_batch)
-                    correct += (preds.argmax(1) == y_batch).sum().item()
-                    total += y_batch.size(0)
-                R[stage][eval_stage] = correct / total
-                print(f"  Accuracy on Stage {eval_stage + 1}: {R[stage][eval_stage]:.4f}")
+                    # Dynamic alpha for DANN warm-up
+                    p = float(i + epoch * len(train_loader)) / (epochs * len(train_loader))
+                    alpha = 2. / (1. + np.exp(-10 * p)) - 1
+                    
+                    optimizer.zero_grad()
+                    
+                    class_preds, conf_preds = model(X_batch, alpha=alpha)
+                    loss_class = criterion_class(class_preds, y_batch)
+                    loss_conf = criterion_conf(conf_preds, conf_batch)
+                    
+                    loss = loss_class + (lambda_dann * loss_conf) 
+                    
+                    loss.backward()
+                    optimizer.step()
+                scheduler.step()
+                                    
+    # --- 3. EVALUATION LOOP (Single View Only ) ---
+            model.eval()
+            with torch.no_grad():
+                for eval_stage in range(num_stages):
+                    correct, total = 0, 0
+                    for batch in test_loaders[eval_stage]:
+                        X_batch = batch['image'].to(device).float().permute(0, 3, 1, 2)
+                        y_batch = batch['label'].to(device).long()
+                        preds, _, = model(X_batch)
+                        correct += (preds.argmax(1) == y_batch).sum().item()
+                        total += y_batch.size(0)
+                    R[stage][eval_stage] = correct / total
+                    print(f"  Accuracy on Stage {eval_stage + 1}: {R[stage][eval_stage]:.4f}")
+
+        # ==========================================
+        # CALCULATE METRICS FOR THIS SEED (INSIDE THE LOOP)
+        # ==========================================
+        ACCd = np.mean([abs(R[num_stages-1][i] - A_i) for i in range(num_stages)])
+        BWTd = np.mean([abs(R[num_stages-1][i] - A_i) - abs(R[i][i] - A_i) for i in range(num_stages - 1)])
+        FWTd = np.mean([abs(R[i-1][i] - A_i) for i in range(1, num_stages)])
+        
+        results_ACCd.append(ACCd)
+        results_BWTd.append(BWTd)
+        results_FWTd.append(FWTd)
 
     # ==========================================
-    # 4. CALCULATE PAPER METRICS
+    # FINAL AVERAGES (OUTSIDE THE LOOP)
     # ==========================================
-    # ACCd = Average absolute deviation from theoretical max after the final stage
-    ACCd = np.mean([abs(R[num_stages-1][i] - A_i) for i in range(num_stages)])
-    
-    # BWTd = Backward transfer deviation
-    BWTd = np.mean([abs(R[num_stages-1][i] - A_i) - abs(R[i][i] - A_i) for i in range(num_stages - 1)])
-    
-    # FWTd = Forward transfer deviation
-    FWTd = np.mean([abs(R[i-1][i] - A_i) for i in range(1, num_stages)])
-    
-    print("\n=== FINAL BENCHMARK METRICS ===")
-    print(f"ACCd: {ACCd:.4f} (Lower is better)")
-    print(f"BWTd: {BWTd:.4f} (Lower is better)")
-    print(f"FWTd: {FWTd:.4f} (Lower is better)")
+    print("\n=== FINAL BENCHMARK METRICS (Across 3 Seeds) ===")
+    print(f"Final ACCd: {np.mean(results_ACCd):.4f} ± {np.std(results_ACCd):.4f}")
+    print(f"Final BWTd: {np.mean(results_BWTd):.4f} ± {np.std(results_BWTd):.4f}")
+    print(f"Final FWTd: {np.mean(results_FWTd):.4f} ± {np.std(results_FWTd):.4f}")
 
 if __name__ == "__main__":
     train_and_benchmark()
