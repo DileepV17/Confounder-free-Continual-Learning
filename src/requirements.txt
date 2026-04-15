@@ -1,0 +1,17 @@
+# Core Deep Learning
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Numerical and Data Processing
+numpy>=1.23.0
+scipy>=1.10.0
+
+# Benchmark Metrics and Statistics
+dcor>=0.6.0
+scikit-learn>=1.2.0
+
+# Visualization and Plotting
+matplotlib>=3.7.0
+seaborn>=0.12.0
+
+utils==1.0.2

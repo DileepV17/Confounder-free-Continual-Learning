@@ -8,11 +8,19 @@ import dcor
 import numpy as np
 import torch
 import torch.utils.data
-from dataset_cf_mf import generate_data
+from dataset import generate_data
 from synthetic_dataset import SyntheticDataset
 from utils import *
 from conv import Conv
 import random
+
+# define accuracy function
+def binary_acc(y_pred, y_true):
+    y_pred_tag = torch.round(y_pred)
+    correct_results_sum = (y_pred_tag == y_true).sum().float()
+    acc = correct_results_sum/y_true.shape[0]
+    acc = torch.round(acc * 100)
+    return acc
 
 
 parser = argparse.ArgumentParser(description='Trainer for Recursive Metadata Normalization')
@@ -389,6 +397,7 @@ if __name__ == '__main__':
     run_experiments()
 
 
+
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -431,59 +440,5 @@ def parse_rmdn_metrics():
     stds = [np.std(rmdn_accd), np.std(rmdn_bwtd), np.std(rmdn_fwtd)]
     return means, stds
 
-def generate_plot():
-    rmdn_means, rmdn_std = parse_rmdn_metrics()
-    if rmdn_means is None: return
 
-    # --- Data from our previous DANN experiments ---
-    labels = ['ACCd\n(Accuracy Error)', 'BWTd\n(Catastrophic Forgetting)', 'FWTd\n(Forward Transfer)']
 
-    # Means
-    baseline_means = [0.1296, -0.0498, 0.1726]
-    ens1_means     = [0.1564, -0.0493, 0.1962]
-    ens2_means     = [0.1615, -0.0035, 0.1609] # Our Two-View Model
-
-    # Standard Deviations
-    baseline_std = [0.0022, 0.0036, 0.0009]
-    ens1_std     = [0.0662, 0.0468, 0.0545]
-    ens2_std     = [0.0650, 0.0483, 0.0137]
-
-    # --- Plotting Setup ---
-    x = np.arange(len(labels))  
-    width = 0.20  
-
-    fig, ax = plt.subplots(figsize=(12, 6.5))
-
-    # Create the Bars
-    rects1 = ax.bar(x - 1.5*width, baseline_means, width, yerr=baseline_std, 
-                    label='Baseline DANN', capsize=5, color='#4c72b0', alpha=0.9)
-    rects2 = ax.bar(x - 0.5*width, ens1_means, width, yerr=ens1_std, 
-                    label='Our Ensemble (1 View)', capsize=5, color='#dd8452', alpha=0.9)
-    rects3 = ax.bar(x + 0.5*width, ens2_means, width, yerr=ens2_std, 
-                    label='Our Ensemble (2 Views)', capsize=5, color='#55a868', alpha=0.9)
-    rects4 = ax.bar(x + 1.5*width, rmdn_means, width, yerr=rmdn_std, 
-                    label="Authors' R-MDN", capsize=5, color='#c44e52', alpha=0.9)
-
-    # Formatting
-    ax.set_ylabel('Metric Value (Closer to 0 is Better)', fontsize=13, fontweight='bold')
-    ax.set_title('Continual Learning Metrics: Diversity Ensembles vs. R-MDN\n(Evaluated Across 3 Random Seeds)', 
-                 fontsize=15, fontweight='bold', pad=15)
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels, fontsize=12)
-    ax.legend(fontsize=11, loc='lower left')
-    ax.axhline(0, color='black', linewidth=1.2, linestyle='--')
-
-    plt.grid(axis='y', linestyle='--', alpha=0.7)
-    plt.tight_layout()
-
-    # Save
-    plt.savefig('final_paper_comparison.png', dpi=300)
-    print("Saved 'final_paper_comparison.png' successfully!")
-    
-    print("\n=== AUTHORS' R-MDN METRICS ===")
-    print(f"Final ACCd: {rmdn_means[0]:.4f} ± {rmdn_std[0]:.4f}")
-    print(f"Final BWTd: {rmdn_means[1]:.4f} ± {rmdn_std[1]:.4f}")
-    print(f"Final FWTd: {rmdn_means[2]:.4f} ± {rmdn_std[2]:.4f}")
-
-if __name__ == "__main__":
-    generate_plot()
